@@ -1,30 +1,18 @@
 #![feature(associated_type_defaults)]
 
-use chrono::prelude::*;
-use clap::Parser;
-use std::io::{Error, ErrorKind};
-use clap::error::ContextKind::MaxOccurrences;
+use std::fs::File;
+use chrono;
+use std::io::{BufRead, BufReader, Error, ErrorKind};
+use std::sync::Arc;
+
 use yahoo_finance_api as yahoo;
 use async_trait::async_trait;
 use std::time::{Duration, UNIX_EPOCH};
-use time::{macros::datetime, OffsetDateTime};
+use time::{OffsetDateTime};
+use tokio::{time as ttime};
 use futures::future::join_all;
 
-#[derive(Parser, Debug)]
-#[clap(
-version = "1.0",
-author = "Claus Matzinger",
-about = "A Manning LiveProject: async Rust"
-)]
-struct Opts {
-    #[clap(short, long, default_value = "AAPL,MSFT,UBER,GOOG,META,TSM,LYFT,AMD")]
-    symbols: String,
-    #[clap(short, long, default_value = "2023-05-05T12:00:09Z")]
-    from: String,
-}
-
-
-struct QuoteDataFuture {}
+const SYMBOL_PATH: &str = "sp500.dec.2022.csv";
 
 struct PriceDifference {}
 
@@ -143,7 +131,6 @@ async fn fetch_closing_data(
     end: &OffsetDateTime,
 ) -> std::io::Result<Vec<f64>> {
     let provider = yahoo::YahooConnector::new();
-    //let st = datetime!(2020-1-1 0:00:00.00 UTC);
     let response = provider
         .get_quote_history(symbol, *beginning, *end)
         .await
@@ -162,50 +149,72 @@ async fn fetch_closing_data(
     }
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let opts = Opts::parse();
-    let symbols: Vec<String> = opts.symbols.split(',').map(|s| s.to_string()).collect();
-    //let symbols: &'static str  = opts.symbols.into_boxed_str().as_ref();
-    let from_utc: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
-    let from = OffsetDateTime::from_unix_timestamp(from_utc.timestamp()).expect("Failed to convert to offset date time");
-    let to = OffsetDateTime::from_unix_timestamp(Utc::now().timestamp()).expect("Failed to convert to offset date time");
+async fn process_symbol_data(symbol: &str,
+                             from: &OffsetDateTime,
+                             end: &OffsetDateTime) {
+    let closes = fetch_closing_data(&symbol, &from, &end).await.unwrap();
+    if !closes.is_empty() {
+        let max_price = MaxPrice {};
+        let min_price = MinPrice {};
+        let price_difference = PriceDifference {};
+        let windowed_sma = WindowedSMA { window_size: 30 };
 
-    // a simple way to output a CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
-    let mut tasks = vec![];
-    for symbol in symbols {
-        let handle = tokio::spawn(async move {
-            let closes = fetch_closing_data(&symbol, &from, &to).await;
-            let closes = closes.expect("BOOM");
-            if !closes.is_empty() {
-                let max_price = MaxPrice {};
-                let min_price = MinPrice {};
-                let price_difference = PriceDifference {};
-                let windowed_sma = WindowedSMA { window_size: 30 };
-
-                // min/max of the period. unwrap() because those are Option types
-                let (period_max, period_min, price_diff, sma)
-                    = tokio::join!(
+        // min/max of the period. unwrap() because those are Option types
+        let (period_max, period_min, price_diff, sma)
+            = tokio::join!(
                         max_price.calculate(&closes),
                         min_price.calculate(&closes),
                         price_difference.calculate(&closes),
                         windowed_sma.calculate( &closes)
                     );
-                let (_, pct_change) = price_diff.unwrap_or((0.0, 0.0));
-                let last_price = *closes.last().unwrap_or(&0.0);
+        let (_, pct_change) = price_diff.unwrap_or((0.0, 0.0));
+        let last_price = *closes.last().unwrap_or(&0.0);
 
-                // a simple way to output CSV data
-                println!(
-                    "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                    from_utc.to_rfc3339(),
-                    symbol,
-                    last_price,
-                    pct_change * 100.0,
-                    period_min.unwrap(),
-                    period_max.unwrap(),
-                    sma.unwrap_or_default().last().unwrap_or(&0.0)
-                );
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            from.to_string(),
+            symbol,
+            last_price,
+            pct_change * 100.0,
+            period_min.unwrap(),
+            period_max.unwrap(),
+            sma.unwrap_or_default().last().unwrap_or(&0.0)
+        );
+    }
+}
+
+async fn read_data(file_path: &str) -> std::io::Result<Vec<String>> {
+    let file = File::open(file_path).expect("Failed to open the file");
+    let reader = BufReader::new(file);
+
+    let data = reader.lines()
+        .filter_map(Result::ok)
+        .collect();
+
+    Ok(data)
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let sp500_symbols = read_data(SYMBOL_PATH).await?;
+    let total_symbols = sp500_symbols.len();
+    let symbols = Arc::new(sp500_symbols);
+
+    // a simple way to output a CSV header
+    println!("period start,symbol,price,change %,min,max,30d avg");
+    let mut tasks = vec![];
+    for s in 0..total_symbols {
+        let arc_symbols = symbols.clone();
+        let symbol = (arc_symbols.as_ref())[s].clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = ttime::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let elapsed_time = chrono::Utc::now() + chrono::Duration::seconds(30);
+                let from = OffsetDateTime::from_unix_timestamp(elapsed_time.timestamp()).expect("Failed to convert to offset date time");
+                let to = OffsetDateTime::from_unix_timestamp(chrono::Utc::now().timestamp()).expect("Failed to convert to offset date time");
+                process_symbol_data(&symbol, &to, &from).await;
             }
         });
         tasks.push(handle);
@@ -283,5 +292,16 @@ mod tests {
 
         let signal = WindowedSMA { window_size: 10 };
         assert_eq!(signal.calculate(&series).await, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn test_reading_from_file() {
+        let symbols = vec!["MMM", "AOS", "ABT", "ABBV", "ACN", "ATVI", "ADM", "ADBE", "ADP", "AAP"];
+
+        let res = read_data("test.csv").await;
+        assert_eq!(
+            res.unwrap(),
+            symbols
+        );
     }
 }
